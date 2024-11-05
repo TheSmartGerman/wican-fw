@@ -1,6 +1,6 @@
 {
     "car_model": "Renault: Kangoo Z.E",
-    "init": "ATSP6;",
+    "init": "ATSH7E4;ATSP6;",
     "pids": [
         {
             "pid": "222002",
