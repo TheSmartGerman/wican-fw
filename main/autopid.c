@@ -185,6 +185,20 @@ static esp_err_t extract_signal_value(const uint8_t* data,
     return ESP_OK;
 }
 
+static void merge_response_frames(uint8_t* data, uint32_t length, uint8_t* merged_frame) {
+    // Initialize merged frame with first 7 bytes
+    for(int i = 0; i < 7; i++) {
+        merged_frame[i] = data[i];
+    }
+    
+    // Process subsequent frames
+    for(int frame = 7; frame < length; frame += 7) {
+        // Perform bitwise OR for each byte position
+        for(int byte = 0; byte < 7 && (frame + byte) < length; byte++) {
+            merged_frame[byte] |= data[frame + byte];
+        }
+    }
+}
 
 esp_err_t autopid_find_standard_pid(uint8_t protocol, char *available_pids, uint32_t available_pids_size) 
 {
@@ -237,6 +251,11 @@ esp_err_t autopid_find_standard_pid(uint8_t protocol, char *available_pids, uint
     if(protocol >= 6 && protocol <= 9) 
     {
         ESP_LOGI(TAG, "Setting protocol %d", protocol);
+
+        static const char *elm327_config = "ate0\rath1\ratl0\rats1\ratst96\r";
+        elm327_process_cmd((uint8_t*)elm327_config, strlen(elm327_config), &frame, &autopidQueue);
+        while (xQueueReceive(autopidQueue, response, pdMS_TO_TICKS(1000)) == pdPASS);
+
         const char* protocol_cmds = supported_protocols[protocol-6];
         ESP_LOGI(TAG, "Sending protocol commands: %s", protocol_cmds);
         elm327_process_cmd((uint8_t*)protocol_cmds, strlen(protocol_cmds), &frame, &autopidQueue);
@@ -270,19 +289,22 @@ esp_err_t autopid_find_standard_pid(uint8_t protocol, char *available_pids, uint
             continue;
         }
 
-        if (xQueueReceive(autopidQueue, response, pdMS_TO_TICKS(1000)) == pdPASS) {
-            ESP_LOGI(TAG, "Raw response length: %lu", response->length);
-            ESP_LOG_BUFFER_HEX(TAG, response->data, response->length);
+    if (xQueueReceive(autopidQueue, response, pdMS_TO_TICKS(1000)) == pdPASS) {
+        ESP_LOGI(TAG, "Raw response length: %lu", response->length);
+        ESP_LOG_BUFFER_HEX(TAG, response->data, response->length);
 
-            // Skip mode byte (0x41) and PID byte
-            if (response->length >= 7) { // Check for minimum length including header
-                // Extract just the bitmap bytes (last 4 bytes)
-                supported_pids = (response->data[3] << 24) | 
-                               (response->data[4] << 16) | 
-                               (response->data[5] << 8) | 
-                               response->data[6];
-                
-                ESP_LOGI(TAG, "Supported PIDs bitmap: 0x%08lx", supported_pids);
+        // Skip mode byte (0x41) and PID byte
+        if (response->length >= 7) {
+            uint8_t merged_frame[7] = {0};
+            merge_response_frames(response->data, response->length, merged_frame);
+            
+            // Extract bitmap from merged frame
+            supported_pids = (merged_frame[3] << 24) | 
+                            (merged_frame[4] << 16) | 
+                            (merged_frame[5] << 8) | 
+                            merged_frame[6];
+            
+            ESP_LOGI(TAG, "Merged frame bitmap: 0x%08lx", supported_pids);
 
                 for (int bit = 0; bit < 32; bit++) {
                     if (supported_pids & (1 << (31 - bit))) {
@@ -674,45 +696,165 @@ char* autopid_get_config(void)
 //     }
 // }
 
-void parse_elm327_response(char *buffer, unsigned char *data, uint32_t *data_length)
-{
+void parse_elm327_response(char *buffer, response_t *response) {
+    ESP_LOGI(TAG, "Starting to parse ELM327 response. Input buffer: %s", buffer);
+    
     int k = 0;
+    int frame_count = 0;
     char *frame;
     char *data_start;
+    uint32_t lowest_header = UINT32_MAX;  // Initialize to maximum value
+    uint32_t highest_header = 0;          // Track highest header
+    uint32_t first_header = 0;
+    bool all_headers_same = true;
+    uint8_t *lowest_header_data = NULL;   // Store the actual data pointer
+    uint8_t lowest_header_length = 0;
 
-    // Split the frames by '\r' or '\r\n'
     frame = strtok(buffer, "\r\n");
-    while (frame != NULL)
-    {
-        if (frame[strlen(frame) - 1] == '>')
-        {
-            frame[strlen(frame) - 1] = '\0';  // Remove the '>' from the last frame
+    ESP_LOGI(TAG, "First frame: %s", frame ? frame : "NULL");
+
+    while (frame != NULL) {
+        ESP_LOGD(TAG, "Processing frame %d: %s", frame_count + 1, frame);
+        frame_count++;
+
+        // Remove trailing '>' if present
+        size_t len = strlen(frame);
+        if (len > 0 && frame[len - 1] == '>') {
+            frame[len - 1] = '\0';
+            ESP_LOGV(TAG, "Removed trailing '>' from frame");
         }
 
-        // Find the first space, then take everything after it
         data_start = strchr(frame, ' ');
-        if (data_start != NULL)
-        {
-            data_start++;  // Move past the space
+        if (data_start != NULL) {
+            int header_length = data_start - frame;
+            char header_str[9] = {0};
+            strncpy(header_str, frame, header_length);
+            uint32_t current_header = strtoul(header_str, NULL, 16);
+            ESP_LOGD(TAG, "Frame %d header: 0x%lX (length: %d)", frame_count, current_header, header_length);
+            
+            // Track highest header
+            if (current_header > highest_header) {
+                ESP_LOGD(TAG, "New highest header found: 0x%lX (previous: 0x%lX)", current_header, highest_header);
+                highest_header = current_header;
+            }
+            
+            // Track first header and compare subsequent headers
+            if (frame_count == 1) {
+                first_header = current_header;
+                ESP_LOGD(TAG, "First header set to: 0x%lX", first_header);
+            } else if (current_header != first_header) {
+                all_headers_same = false;
+                ESP_LOGD(TAG, "Different header detected: 0x%lX != 0x%lX", current_header, first_header);
+            }
 
-            // Parse and store the data
-            while (*data_start != '\0')
-            {
-                if (*data_start == ' ')  // Skip spaces
-                {
+            data_start++;
+
+            // Handle different header formats
+            switch (header_length) {
+                case 2: 
+                    data_start += 9;
+                    ESP_LOGV(TAG, "2-byte header format: Adjusted data_start by 9");
+                    break;
+                case 3:
+                case 8:
+                    ESP_LOGV(TAG, "%d-byte header format: No adjustment needed", header_length);
+                    break;
+                default:
+                    ESP_LOGW(TAG, "Unexpected header length: %d, skipping frame", header_length);
+                    frame = strtok(NULL, "\r\n");
+                    continue;
+            }
+
+            // Store start position for copying data
+            char *current_data_start = data_start;
+            int current_length = 0;
+
+            // Count data bytes in current frame
+            char *temp_data = data_start;
+            while (*temp_data != '\0') {
+                if (*temp_data == ' ') {
+                    temp_data++;
+                    continue;
+                }
+                if (strlen(temp_data) < 2) break;
+                current_length++;
+                temp_data += 2;
+            }
+
+            // If this is the lowest header so far, store its data
+            if (current_header < lowest_header) {
+                ESP_LOGD(TAG, "New lowest header found: 0x%lX (previous: 0x%lX)", current_header, lowest_header);
+                lowest_header = current_header;
+                lowest_header_length = current_length;
+                
+                // Allocate space and copy data for lowest header frame
+                if (lowest_header_data == NULL) {
+                    lowest_header_data = (uint8_t*)malloc(current_length);
+                } else {
+                    lowest_header_data = (uint8_t*)realloc(lowest_header_data, current_length);
+                }
+                
+                // Parse and store the data bytes for this frame
+                int idx = 0;
+                while (*current_data_start != '\0') {
+                    if (*current_data_start == ' ') {
+                        current_data_start++;
+                        continue;
+                    }
+                    if (strlen(current_data_start) < 2) break;
+                    
+                    char byte_str[3] = {current_data_start[0], current_data_start[1], 0};
+                    lowest_header_data[idx++] = (unsigned char)strtol(byte_str, NULL, 16);
+                    current_data_start += 2;
+                }
+                ESP_LOGD(TAG, "Stored %d bytes from lowest header frame", idx);
+            }
+
+            // Parse data bytes into main response buffer
+            ESP_LOGV(TAG, "Starting data byte parsing at position: %s", data_start);
+            while (*data_start != '\0') {
+                if (*data_start == ' ') {
                     data_start++;
                     continue;
                 }
-                char hex_byte[3] = {data_start[0], data_start[1], '\0'};
-                data[k++] = (unsigned char) strtol(hex_byte, NULL, 16);
-                data_start += 2;  // Move to the next hex pair
+                if (strlen(data_start) < 2) {
+                    ESP_LOGW(TAG, "Incomplete byte at end of frame: %s", data_start);
+                    break;
+                }
+                
+                char byte_str[3] = {data_start[0], data_start[1], 0};
+                response->data[k] = (unsigned char)strtol(byte_str, NULL, 16);
+                ESP_LOGV(TAG, "Parsed byte %d: 0x%02X from %s", k, response->data[k], byte_str);
+                k++;
+                data_start += 2;
             }
+        } else {
+            ESP_LOGW(TAG, "No space delimiter found in frame: %s", frame);
         }
-
         frame = strtok(NULL, "\r\n");
     }
 
-    *data_length = k;
+    response->length = k;
+    
+    // Set priority data based on frame count and header comparison
+    if (frame_count <= 2 || all_headers_same) {
+        response->priority_data = NULL;
+        response->priority_data_len = 0;
+        if (lowest_header_data != NULL) {
+            free(lowest_header_data);
+        }
+        ESP_LOGI(TAG, "Null priority data set - frames: %d, all headers same: %d", 
+                frame_count, all_headers_same);
+    } else {
+        response->priority_data = lowest_header_data;
+        response->priority_data_len = lowest_header_length;
+        ESP_LOGI(TAG, "Priority data set - length: %u, starting with byte: 0x%02X", 
+                response->priority_data_len, 
+                response->priority_data[0]);
+    }
+    
+    ESP_LOGI(TAG, "Parsing complete. Headers - Lowest: 0x%lX, Highest: 0x%lX, Total frames: %d, Total bytes: %lu, Priority data length: %u",
+            lowest_header, highest_header, frame_count, response->length, response->priority_data_len);
 }
 
 static void append_to_buffer(char *buffer, const char *new_data) 
@@ -741,7 +883,7 @@ void autopid_parser(char *str, uint32_t len, QueueHandle_t *q)
             if(strstr(str, "NO DATA") == NULL && strstr(str, "ERROR") == NULL)
             {
                 // Parse the accumulated buffer
-                parse_elm327_response(auto_pid_buf,  response.data, &response.length);
+                parse_elm327_response(auto_pid_buf, &response);
                 if (xQueueSend(autopidQueue, &response, pdMS_TO_TICKS(1000)) != pdPASS)
                 {
                     ESP_LOGE(TAG, "Failed to send to queue");
@@ -1032,15 +1174,28 @@ static void autopid_task(void *pvParameters)
                                                     const char* param_name = strchr(param->name, '-');
                                                     if(param_name && strcmp(param_name + 1, pid_info->params[p].name) == 0)
                                                     {
-                                                        ESP_LOGI(TAG, "Processing parameter: %s", pid_info->params[p].name);
-                                                        
-                                                        esp_err_t err = extract_signal_value(
-                                                            elm327_response.data,           // Your CAN response data buffer
-                                                            elm327_response.length,         // Length of your CAN response data
-                                                            &pid_info->params[p],    // Parameter definition from pid_info
-                                                            &param->value            // Where to store the result
-                                                        );
+                                                        esp_err_t err = ESP_FAIL;
 
+                                                        ESP_LOGI(TAG, "Processing parameter: %s", pid_info->params[p].name);
+                                                        if(elm327_response.priority_data != NULL && elm327_response.priority_data != 0)
+                                                        {
+                                                            err = extract_signal_value(
+                                                                elm327_response.priority_data,           // Your CAN response data buffer
+                                                                elm327_response.priority_data_len,         // Length of your CAN response data
+                                                                &pid_info->params[p],    // Parameter definition from pid_info
+                                                                &param->value            // Where to store the result
+                                                            );
+                                                        }
+                                                        else
+                                                        {
+                                                            err = extract_signal_value(
+                                                                elm327_response.data,           // Your CAN response data buffer
+                                                                elm327_response.length,         // Length of your CAN response data
+                                                                &pid_info->params[p],    // Parameter definition from pid_info
+                                                                &param->value            // Where to store the result
+                                                            );
+                                                        }
+ 
                                                         if (err != ESP_OK) {
                                                             ESP_LOGE(TAG, "Failed to extract signal: %s", esp_err_to_name(err));
                                                             break;
@@ -1234,6 +1389,11 @@ all_pids_t* load_all_pids(void) {
                     cJSON* min_value_item = cJSON_GetObjectItem(pid, "MinValue");
                     cJSON* max_value_item = cJSON_GetObjectItem(pid, "MaxValue");
 
+                    if(cJSON_GetArraySize(pids) > 0)
+                    {
+                        all_pids->pid_custom_en = true;
+                    }
+                    
                     curr_pid->cmd = pid_item ? (char*)malloc(strlen(pid_item->valuestring) + 2) : NULL;
                     if (curr_pid->cmd && pid_item && strlen(pid_item->valuestring) > 1)
                     {
@@ -1363,7 +1523,7 @@ all_pids_t* load_all_pids(void) {
 
                                         curr_pid->cmd = malloc(8); // "01XX1\r\0" needs 8 bytes
                                         if(curr_pid->cmd) {
-                                            sprintf(curr_pid->cmd, "01%s1\r", pid_hex);
+                                            sprintf(curr_pid->cmd, "01%s\r", pid_hex);
                                         }
                                     }
                                 }
@@ -1412,11 +1572,6 @@ all_pids_t* load_all_pids(void) {
                     if (pids) 
                     {
                         cJSON* pid;
-
-                        if(cJSON_GetArraySize(pids) > 0)
-                        {
-                            all_pids->pid_custom_en = true;
-                        }
                         
                         cJSON_ArrayForEach(pid, pids) 
                         {
@@ -1578,6 +1733,13 @@ void autopid_init(char* id)
         xautopid_event_group = xEventGroupCreate();
     }
 
+    autopidQueue = xQueueCreate(QUEUE_SIZE, sizeof(response_t));
+    if (autopidQueue == NULL)
+    {
+        ESP_LOGE(TAG, "Failed to create queue");
+        return;
+    }
+
     all_pids = load_all_pids();
     
     if (all_pids)
@@ -1587,7 +1749,13 @@ void autopid_init(char* id)
         if (!all_pids->mutex)
         {
             ESP_LOGE(TAG, "Failed to create all_pids mutex");
+            return;
         }
+    }
+    else
+    {
+        ESP_LOGE(TAG, "all_pids is NULL");
+        return;
     }
 
     // autopid_load_config(config_str);
@@ -1600,13 +1768,6 @@ void autopid_init(char* id)
     // {
     //     car.pid_count = 0;
     // }
-    
-    autopidQueue = xQueueCreate(QUEUE_SIZE, sizeof(response_t));
-    if (autopidQueue == NULL)
-    {
-        ESP_LOGE(TAG, "Failed to create queue");
-        return;
-    }
 
     xTaskCreate(autopid_task, "autopid_task", 5000, (void *)AF_INET, 5, NULL);
 
